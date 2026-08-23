@@ -1,0 +1,35 @@
+name: WNBA Live Play By Play
+
+on:
+  schedule:
+    # Every 5 minutes, 10:00am-11:30pm ET (14-23,0-3 UTC during EDT) --
+    # covers virtually every realistic WNBA tip time. Wide and frequent on
+    # purpose: this repo is public, so GitHub Actions minutes are
+    # unlimited here (unlike the private main pipeline repo), no budget
+    # tradeoff to make.
+    - cron: "*/5 14-23,0-3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  live-pbp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write Google service account credentials
+        run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/gcreds.json"
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      - name: Capture live first-4-minutes play by play
+        env:
+          GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
+        run: python wnba_playbyplay_live.py
