@@ -58,7 +58,8 @@ PBP_HEADER = ["Event ID", "Date", "Matchup", "Period", "Clock", "Seconds Remaini
               "Away Score", "Home Score", "Play", "Scoring Play (Y/N)"]
 
 FB_SHEET_NAME = "Live First Basket"
-FB_HEADER = ["Event ID", "Date", "Matchup", "Player", "Team", "Position", "Period", "Clock", "Captured At"]
+FB_HEADER = ["Event ID", "Date", "Matchup", "Player", "Athlete ID", "Team", "Position",
+             "Method", "Period", "Clock", "Captured At"]
 
 # First 4 minutes of Q1 only, same window the main pipeline uses.
 FIRST_N_MINUTES = 4
@@ -123,6 +124,27 @@ def get_todays_events():
     return resp.json().get("events", [])
 
 
+def format_shot_method(type_text, points):
+    """Turns ESPN's verbose shot-type text (e.g. "Pullup Jump Shot",
+    "Driving Layup Shot") plus the point value into a short label like
+    "3-Pointer" or "Layup", matching the plain "layup, 3pt, etc." vocab
+    the tracker/notification should show instead of ESPN's raw wording."""
+    t = (type_text or "").lower()
+    if "dunk" in t:
+        base = "Dunk"
+    elif "layup" in t:
+        base = "Layup"
+    elif "hook" in t:
+        base = "Hook Shot"
+    elif "tip" in t:
+        base = "Tip-In"
+    else:
+        base = "Jump Shot"
+    if points == 3:
+        return "3-Pointer" if base == "Jump Shot" else f"3PT {base}"
+    return base
+
+
 def find_first_basket(plays, team_id_to_name):
     """Scans ALL plays (not just the first-4-minutes window below) for the
     game's actual first made shot -- same definition the main pipeline's
@@ -137,10 +159,13 @@ def find_first_basket(plays, team_id_to_name):
             continue
         player = get_player(athlete_id)
         team_id = play.get("team", {}).get("id", "")
+        points = play.get("scoreValue") or play.get("pointsAttempted")
         return {
             "name": player["name"],
+            "athlete_id": athlete_id,
             "position": player["position"],
             "team": team_id_to_name.get(team_id, team_id or ""),
+            "method": format_shot_method(play.get("type", {}).get("text", ""), points),
             "period": play.get("period", {}).get("number"),
             "clock": play.get("clock", {}).get("displayValue", ""),
         }
@@ -259,10 +284,11 @@ def main():
             continue
 
         if first_basket and event_id not in fb_known_event_ids:
-            fb_new_rows.append([event_id, today_str, matchup, first_basket["name"], first_basket["team"],
-                                 first_basket["position"], first_basket["period"], first_basket["clock"], now_str])
+            fb_new_rows.append([event_id, today_str, matchup, first_basket["name"], first_basket["athlete_id"],
+                                 first_basket["team"], first_basket["position"], first_basket["method"],
+                                 first_basket["period"], first_basket["clock"], now_str])
             fb_known_event_ids.add(event_id)
-            print(f"    First basket: {first_basket['name']} ({first_basket['team']})")
+            print(f"    First basket: {first_basket['name']} ({first_basket['team']}) -- {first_basket['method']}")
 
         if not plays and not window_closed:
             print("    Nothing capturable yet -- will retry next run.")
