@@ -57,9 +57,35 @@ TEAM_ABBR = {
 PBP_HEADER = ["Event ID", "Date", "Matchup", "Period", "Clock", "Seconds Remaining", "Team",
               "Away Score", "Home Score", "Play", "Scoring Play (Y/N)"]
 
+FB_SHEET_NAME = "Live First Basket"
+FB_HEADER = ["Event ID", "Date", "Matchup", "Player", "Team", "Position", "Period", "Clock", "Captured At"]
+
 # First 4 minutes of Q1 only, same window the main pipeline uses.
 FIRST_N_MINUTES = 4
 MIN_SECONDS_REMAINING = (10 - FIRST_N_MINUTES) * 60  # 360
+
+# Simple in-run cache -- same athlete can be the first-basket scorer looked
+# up at most once per run anyway, but avoids re-hitting ESPN if it ever is.
+_athlete_cache = {}
+
+
+def get_player(athlete_id):
+    """Resolves an athlete ID to name/position via ESPN's athlete endpoint --
+    same source and shape the main pipeline's own lookup uses, kept
+    independent here since this repo is intentionally self-contained."""
+    if athlete_id in _athlete_cache:
+        return _athlete_cache[athlete_id]
+    url = f"https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba/athletes/{athlete_id}?lang=en&region=us"
+    resp = requests.get(url, impersonate="chrome", timeout=15)
+    if resp.status_code != 200:
+        result = {"name": "UNKNOWN", "position": ""}
+    else:
+        data = resp.json()
+        name = data.get("fullName") or data.get("displayName") or "UNKNOWN"
+        pos = data.get("position", {}).get("abbreviation", "")
+        result = {"name": name, "position": pos[0] if pos else ""}
+    _athlete_cache[athlete_id] = result
+    return result
 
 
 def get_abbr(full_name, espn_fallback):
@@ -97,10 +123,35 @@ def get_todays_events():
     return resp.json().get("events", [])
 
 
-def fetch_first_minutes_plays(event_id):
-    """Returns (rows, window_closed). window_closed is True once the feed
-    shows play(s) past the first-4-minutes mark -- proof this event's
-    window is fully captured and never needs re-fetching again."""
+def find_first_basket(plays, team_id_to_name):
+    """Scans ALL plays (not just the first-4-minutes window below) for the
+    game's actual first made shot -- same definition the main pipeline's
+    analyze_game() uses (first scoringPlay with a shooter), just evaluated
+    live instead of after the whole game is final."""
+    for play in plays:
+        if not play.get("scoringPlay", False):
+            continue
+        participants = play.get("participants", [])
+        athlete_id = participants[0]["athlete"]["id"] if participants else None
+        if not athlete_id:
+            continue
+        player = get_player(athlete_id)
+        team_id = play.get("team", {}).get("id", "")
+        return {
+            "name": player["name"],
+            "position": player["position"],
+            "team": team_id_to_name.get(team_id, team_id or ""),
+            "period": play.get("period", {}).get("number"),
+            "clock": play.get("clock", {}).get("displayValue", ""),
+        }
+    return None
+
+
+def fetch_game_data(event_id):
+    """Returns (rows, window_closed, first_basket) from a single fetch.
+    rows/window_closed cover the first-4-minutes Play By Play capture as
+    before; first_basket is the resolved scorer of the game's actual first
+    basket (see find_first_basket), independent of that 4-minute window."""
     url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/summary?event={event_id}"
     resp = requests.get(url, impersonate="chrome", timeout=15)
     resp.raise_for_status()
@@ -108,6 +159,8 @@ def fetch_first_minutes_plays(event_id):
     plays = data.get("plays", [])
     competitors = data["header"]["competitions"][0]["competitors"]
     team_id_to_name = {c["team"]["id"]: c["team"]["displayName"] for c in competitors}
+
+    first_basket = find_first_basket(plays, team_id_to_name)
 
     rows = []
     window_closed = False
@@ -132,16 +185,16 @@ def fetch_first_minutes_plays(event_id):
         text = play.get("text", "")
         is_score = play.get("scoringPlay", False)
         rows.append((period, clock_display, seconds_remaining, team_name, away_score, home_score, text, "Y" if is_score else "N"))
-    return rows, window_closed
+    return rows, window_closed, first_basket
 
 
-def get_or_create_pbp_tab(spreadsheet):
+def get_or_create_tab(spreadsheet, sheet_name, header):
     try:
-        return spreadsheet.worksheet(PBP_SHEET_NAME)
+        return spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
-        print(f"'{PBP_SHEET_NAME}' tab doesn't exist yet -- creating it.")
-        ws = spreadsheet.add_worksheet(title=PBP_SHEET_NAME, rows=2000, cols=len(PBP_HEADER))
-        ws.update([PBP_HEADER], "A1", value_input_option="USER_ENTERED")
+        print(f"'{sheet_name}' tab doesn't exist yet -- creating it.")
+        ws = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=len(header))
+        ws.update([header], "A1", value_input_option="USER_ENTERED")
         return ws
 
 
@@ -154,14 +207,23 @@ def main():
     print("Checking today's scoreboard for live/finished games...")
     events = get_todays_events()
 
-    pbp_ws = get_or_create_pbp_tab(spreadsheet)
+    pbp_ws = get_or_create_tab(spreadsheet, PBP_SHEET_NAME, PBP_HEADER)
     existing_values = pbp_ws.get_all_values()
     if not existing_values:
         existing_values = [PBP_HEADER]
     existing_rows = existing_values[1:]
 
+    fb_ws = get_or_create_tab(spreadsheet, FB_SHEET_NAME, FB_HEADER)
+    fb_existing_values = fb_ws.get_all_values()
+    if not fb_existing_values:
+        fb_existing_values = [FB_HEADER]
+    fb_existing_rows = fb_existing_values[1:]
+    fb_known_event_ids = {r[0] for r in fb_existing_rows if r}
+
     updates = {}  # event_id -> new_rows, only for events actually re-fetched
+    fb_new_rows = []  # newly-identified first baskets this run
     today_str = datetime.now().strftime("%Y-%m-%d")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for event in events:
         state = event["status"]["type"]["state"]
@@ -191,10 +253,16 @@ def main():
 
         print(f"  Fetching {matchup} (event {event_id}, status: {state})...")
         try:
-            plays, window_closed = fetch_first_minutes_plays(event_id)
+            plays, window_closed, first_basket = fetch_game_data(event_id)
         except Exception as e:
             print(f"    Could not fetch: {e}")
             continue
+
+        if first_basket and event_id not in fb_known_event_ids:
+            fb_new_rows.append([event_id, today_str, matchup, first_basket["name"], first_basket["team"],
+                                 first_basket["position"], first_basket["period"], first_basket["clock"], now_str])
+            fb_known_event_ids.add(event_id)
+            print(f"    First basket: {first_basket['name']} ({first_basket['team']})")
 
         if not plays and not window_closed:
             print("    Nothing capturable yet -- will retry next run.")
@@ -204,6 +272,10 @@ def main():
         updates[event_id] = new_rows
         status_note = "window closed, fully captured" if window_closed else "still filling in, will refine next run"
         print(f"    Captured {len(new_rows)} play(s) -- {status_note}.")
+
+    if fb_new_rows:
+        print(f"Writing Live First Basket: {len(fb_new_rows)} new game(s).")
+        fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
 
     if not updates:
         print("Nothing new to update.")
