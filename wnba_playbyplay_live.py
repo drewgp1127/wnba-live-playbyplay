@@ -27,6 +27,7 @@ it public costs nothing competitively.
 
 import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from curl_cffi import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -35,6 +36,7 @@ CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "gcreds.json")
 SPREADSHEET_ID = "1cHokxmusavnAfYr0DqJkNSWZ7Eb8_74L5YGAdleGAuQ"
 PBP_SHEET_NAME = "Play By Play"
 SPORT_PATH = "basketball/wnba"
+LOCAL_TZ = ZoneInfo("America/New_York")
 
 # Same filter the main pipeline uses to keep All-Star/exhibition games out
 # of anything real -- duplicated here since this repo is intentionally
@@ -117,7 +119,10 @@ def row_proves_window_closed(row):
 
 
 def get_todays_events():
-    target_str = datetime.now().strftime("%Y%m%d")
+    # datetime.now() is naive and reads UTC on GitHub Actions runners --
+    # between 8pm-midnight ET, UTC has already rolled to the next calendar
+    # date, which would silently pull tomorrow's slate instead of today's.
+    target_str = datetime.now(LOCAL_TZ).strftime("%Y%m%d")
     url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/scoreboard?dates={target_str}"
     resp = requests.get(url, impersonate="chrome", timeout=15)
     resp.raise_for_status()
@@ -247,8 +252,8 @@ def main():
 
     updates = {}  # event_id -> new_rows, only for events actually re-fetched
     fb_new_rows = []  # newly-identified first baskets this run
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
+    now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     for event in events:
         state = event["status"]["type"]["state"]
