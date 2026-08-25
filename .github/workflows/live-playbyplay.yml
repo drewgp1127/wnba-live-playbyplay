@@ -32,4 +32,5 @@ jobs:
       - name: Capture live first-4-minutes play by play
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
+          MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
         run: python wnba_playbyplay_live.py
