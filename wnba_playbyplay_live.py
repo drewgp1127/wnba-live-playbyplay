@@ -46,9 +46,16 @@ that secret isn't set, this feature just quietly no-ops.
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from curl_cffi import requests
+
 import gspread
+from curl_cffi import requests
 from google.oauth2.service_account import Credentials
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 CREDENTIALS_PATH = os.environ.get("GOOGLE_CREDENTIALS_PATH", "gcreds.json")
 SPREADSHEET_ID = "1cHokxmusavnAfYr0DqJkNSWZ7Eb8_74L5YGAdleGAuQ"
@@ -103,6 +110,34 @@ POST_TIP_WINDOW_SECONDS_REMAINING = (60, 420)
 _athlete_cache = {}
 
 
+def _is_retryable(exc):
+    """5xx, timeouts, and connection errors only -- never 4xx (won't fix
+    itself on retry)."""
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        return resp is not None and resp.status_code >= 500
+    return False
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=2, max=8),
+    retry=retry_if_exception(_is_retryable),
+    reraise=True,
+)
+def _get(url, **kwargs):
+    """Same retry policy as the main pipeline's ESPNSource (firstiq/sources/
+    espn.py) -- 3 attempts, ~2s/4s/8s exponential backoff, only on 5xx/
+    timeout/connection errors. This repo intentionally stays independent of
+    firstiq (no shared import, see module docstring), so the policy is
+    duplicated here rather than shared."""
+    resp = requests.get(url, impersonate="chrome", timeout=15, **kwargs)
+    resp.raise_for_status()
+    return resp
+
+
 def get_player(athlete_id):
     """Resolves an athlete ID to name/position via ESPN's athlete endpoint --
     same source and shape the main pipeline's own lookup uses, kept
@@ -110,14 +145,13 @@ def get_player(athlete_id):
     if athlete_id in _athlete_cache:
         return _athlete_cache[athlete_id]
     url = f"https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba/athletes/{athlete_id}?lang=en&region=us"
-    resp = requests.get(url, impersonate="chrome", timeout=15)
-    if resp.status_code != 200:
-        result = {"name": "UNKNOWN", "position": ""}
-    else:
-        data = resp.json()
+    try:
+        data = _get(url).json()
         name = data.get("fullName") or data.get("displayName") or "UNKNOWN"
         pos = data.get("position", {}).get("abbreviation", "")
         result = {"name": name, "position": pos[0] if pos else ""}
+    except Exception:
+        result = {"name": "UNKNOWN", "position": ""}
     _athlete_cache[athlete_id] = result
     return result
 
@@ -190,9 +224,7 @@ def get_todays_events():
     # date, which would silently pull tomorrow's slate instead of today's.
     target_str = datetime.now(LOCAL_TZ).strftime("%Y%m%d")
     url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/scoreboard?dates={target_str}"
-    resp = requests.get(url, impersonate="chrome", timeout=15)
-    resp.raise_for_status()
-    return resp.json().get("events", [])
+    return _get(url).json().get("events", [])
 
 
 def format_shot_method(type_text, points):
@@ -251,10 +283,10 @@ def fetch_game_data(event_id):
     window. first_basket is the resolved scorer of the game's actual first
     basket (see find_first_basket), independent of that per-team cutoff."""
     url = f"https://site.api.espn.com/apis/site/v2/sports/{SPORT_PATH}/summary?event={event_id}"
-    resp = requests.get(url, impersonate="chrome", timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    plays = data.get("plays", [])
+    data = _get(url).json()
+    if "plays" not in data:
+        raise ValueError(f"Event {event_id}: summary response has no 'plays' key -- ESPN response shape may have changed.")
+    plays = data["plays"]
     competitors = data["header"]["competitions"][0]["competitors"]
     team_id_to_name = {c["team"]["id"]: c["team"]["displayName"] for c in competitors}
 
