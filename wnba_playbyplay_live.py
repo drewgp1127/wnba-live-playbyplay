@@ -151,7 +151,11 @@ def get_player(athlete_id):
         pos = data.get("position", {}).get("abbreviation", "")
         result = {"name": name, "position": pos[0] if pos else ""}
     except Exception:
-        result = {"name": "UNKNOWN", "position": ""}
+        # Don't cache a transient lookup failure as a resolved "UNKNOWN"
+        # athlete -- that would permanently poison this event's first-basket
+        # record for the rest of the run. Return None so the caller retries
+        # the whole event on the next poll instead.
+        return None
     _athlete_cache[athlete_id] = result
     return result
 
@@ -261,6 +265,8 @@ def find_first_basket(plays, team_id_to_name):
         if not athlete_id:
             continue
         player = get_player(athlete_id)
+        if player is None:
+            return None  # unresolved lookup -- retry this event on the next poll
         team_id = play.get("team", {}).get("id", "")
         points = play.get("scoreValue") or play.get("pointsAttempted")
         return {
