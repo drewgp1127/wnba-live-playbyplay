@@ -2,17 +2,34 @@ name: WNBA Live Play By Play
 
 on:
   schedule:
-    # Every 5 minutes, 10:00am-11:30pm ET (14-23,0-3 UTC during EDT) --
-    # covers virtually every realistic WNBA tip time. Wide and frequent on
-    # purpose: this repo is public, so GitHub Actions minutes are
-    # unlimited here (unlike the private main pipeline repo), no budget
-    # tradeoff to make.
-    - cron: "*/5 14-23,0-3 * * *"
+    # GitHub's `schedule` trigger is best-effort and, in practice for this
+    # repo, was landing roughly once an hour instead of the "every 5
+    # minutes" a naive `*/5` cron implies -- unacceptable during a live
+    # game. Instead of leaning on GitHub to fire reliably every 5 minutes,
+    # each of these 3 launches starts ONE long job that loops and polls
+    # internally (see the run step below), so GitHub only needs to fire
+    # 3 times a day, staggered ~4.5h apart to cover 10:00am-11:30pm ET
+    # (14:00-03:30 UTC during EDT) with a little overlap at the seams.
+    - cron: "0 14 * * *"   # ~10:00am ET
+    - cron: "30 18 * * *"  # ~2:30pm ET
+    - cron: "0 23 * * *"   # ~7:00pm ET
   workflow_dispatch: {}
+
+concurrency:
+  # Never let two of these loops write to the shared Google Sheet at the
+  # same time -- the script does a full clear()+rewrite of the Play By
+  # Play tab, so an overlapping run could wipe out the other's writes.
+  # Queue (don't cancel) so a staggered launch just waits its turn instead
+  # of losing the run outright.
+  group: live-pbp
+  cancel-in-progress: false
 
 jobs:
   live-pbp:
     runs-on: ubuntu-latest
+    # Comfortably above the ~265-minute loop below, well under GitHub's
+    # 360-minute hard cap for hosted runners.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +46,16 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
-      - name: Capture live first-4-minutes play by play
+      - name: Capture live first-4-minutes play by play (polls every 5 min for ~4.4h)
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
           MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
-        run: python wnba_playbyplay_live.py
+        run: |
+          END=$((SECONDS + 15900))  # ~265 minutes
+          while true; do
+            python wnba_playbyplay_live.py
+            if [ "$SECONDS" -ge "$END" ]; then
+              break
+            fi
+            sleep 300
+          done
