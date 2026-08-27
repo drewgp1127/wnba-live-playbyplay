@@ -100,6 +100,15 @@ MAIN_PIPELINE_INTRADAY_WORKFLOW = "intraday-updates.yml"
 MAIN_PIPELINE_BRANCH = "master"
 DISPATCH_LOG_SHEET_NAME = "Post-Tip Dispatch Log"
 DISPATCH_LOG_HEADER = ["Event ID", "Date", "Matchup", "Dispatched At"]
+
+# Second dispatch, fired at a different moment and for a different
+# reason: once BOTH teams have logged their own first scoring play, the
+# first basket and both first-team-baskets are decided, so the picks
+# riding on them can be graded immediately instead of sitting Pending
+# until the 8am pipeline builds Game Log. Kept in its own log tab so the
+# two dispatches dedupe independently -- a game fires each exactly once.
+MAIN_PIPELINE_GRADING_WORKFLOW = "live-grading.yml"
+GRADING_DISPATCH_LOG_SHEET_NAME = "Live Grading Dispatch Log"
 # Widened past a single instant to reliably catch it despite 5-minute
 # polling -- WNBA quarters are 10 minutes, so this is elapsed game time of
 # roughly 3-9 minutes into Q1.
@@ -200,11 +209,11 @@ def is_a_few_minutes_into_first_quarter(event):
     return low <= seconds_remaining <= high
 
 
-def trigger_main_pipeline_intraday_run(token):
-    """Fires a workflow_dispatch on the main (private) pipeline repo's
-    intraday-updates workflow. Returns True on success; never raises, so a
+def trigger_main_pipeline_workflow(token, workflow):
+    """Fires a workflow_dispatch on one of the main (private) pipeline
+    repo's workflows. Returns True on success; never raises, so a
     dispatch failure never takes down this run's actual play-by-play work."""
-    url = f"https://api.github.com/repos/{MAIN_PIPELINE_REPO}/actions/workflows/{MAIN_PIPELINE_INTRADAY_WORKFLOW}/dispatches"
+    url = f"https://api.github.com/repos/{MAIN_PIPELINE_REPO}/actions/workflows/{workflow}/dispatches"
     try:
         resp = requests.post(
             url,
@@ -218,7 +227,7 @@ def trigger_main_pipeline_intraday_run(token):
         )
         return resp.status_code == 204
     except Exception as e:
-        print(f"    Could not trigger main pipeline intraday run: {e}")
+        print(f"    Could not trigger main pipeline workflow {workflow}: {e}")
         return False
 
 
@@ -363,8 +372,15 @@ def main():
         dispatch_existing_values = [DISPATCH_LOG_HEADER]
     dispatched_event_ids = {r[0] for r in dispatch_existing_values[1:] if r}
 
+    grading_dispatch_ws = get_or_create_tab(spreadsheet, GRADING_DISPATCH_LOG_SHEET_NAME, DISPATCH_LOG_HEADER)
+    grading_dispatch_values = grading_dispatch_ws.get_all_values()
+    if not grading_dispatch_values:
+        grading_dispatch_values = [DISPATCH_LOG_HEADER]
+    grading_dispatched_event_ids = {r[0] for r in grading_dispatch_values[1:] if r}
+
     updates = {}  # event_id -> new_rows, only for events actually re-fetched
     fb_new_rows = []  # newly-identified first baskets this run
+    grade_ready = []  # events whose opening just became fully decided
     today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
     now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -395,7 +411,7 @@ def main():
             and is_a_few_minutes_into_first_quarter(event)
         ):
             print(f"  {matchup} is a few minutes into Q1 -- triggering an early intraday pipeline refresh...")
-            if trigger_main_pipeline_intraday_run(dispatch_token):
+            if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_INTRADAY_WORKFLOW):
                 # Log immediately, before doing anything else that could fail --
                 # otherwise a later exception this run leaves the dispatch fired
                 # but unrecorded, and the next run fires it again.
@@ -407,6 +423,13 @@ def main():
 
         rows_for_event = [r for r in existing_rows if r and r[0] == event_id]
         if rows_for_event and event_already_captured(rows_for_event):
+            # Nothing left to fetch for this game -- but if its grading
+            # dispatch never went out (it failed, or this game was
+            # captured before live grading existed), fire it now. The
+            # plays are already on the sheet, so the grader has what it
+            # needs immediately.
+            if dispatch_token and event_id not in grading_dispatched_event_ids:
+                grade_ready.append((event_id, matchup))
             continue
 
         print(f"  Fetching {matchup} (event {event_id}, status: {state})...")
@@ -432,22 +455,47 @@ def main():
         status_note = "both teams scored, fully captured" if fully_captured else "still waiting on one team, will refine next run"
         print(f"    Captured {len(new_rows)} play(s) -- {status_note}.")
 
+        # Both teams have scored, so FB and both FTs are settled for this
+        # game. Queue a grading dispatch -- but don't fire it here: the
+        # plays it needs are only written to the sheet at the end of this
+        # run, and dispatching first would race the grader against data
+        # that isn't there yet.
+        if fully_captured and dispatch_token and event_id not in grading_dispatched_event_ids:
+            grade_ready.append((event_id, matchup))
+
     if fb_new_rows:
         print(f"Writing Live First Basket: {len(fb_new_rows)} new game(s).")
         fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
 
-    if not updates:
-        print("Nothing new to update.")
-        return
+    if updates:
+        kept_rows = [r for r in existing_rows if r and r[0] not in updates]
+        all_rows = kept_rows + [row for rows in updates.values() for row in rows]
 
-    kept_rows = [r for r in existing_rows if r and r[0] not in updates]
-    all_rows = kept_rows + [row for rows in updates.values() for row in rows]
+        print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
+        pbp_ws.clear()
+        pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
+        if all_rows:
+            pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+    else:
+        print("No new plays to write.")
 
-    print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
-    pbp_ws.clear()
-    pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
-    if all_rows:
-        pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+    # Only now that the plays are actually on the sheet is it safe to ask
+    # the main pipeline to grade off them. One dispatch covers every game
+    # that became decided this run -- the grader scans all pending picks,
+    # so firing it once per run is enough no matter how many games landed.
+    if grade_ready:
+        names = ", ".join(m for _, m in grade_ready)
+        print(f"Opening decided for {names} -- triggering live grading...")
+        if trigger_main_pipeline_workflow(dispatch_token, MAIN_PIPELINE_GRADING_WORKFLOW):
+            grading_dispatch_ws.append_rows(
+                [[event_id, today_str, matchup, now_str] for event_id, matchup in grade_ready],
+                value_input_option="USER_ENTERED",
+            )
+            print("    Triggered and logged.")
+        else:
+            print("    Grading dispatch failed -- will retry next run "
+                  "(the scheduled live-grading run is the backstop).")
+
     print("Done.")
 
 
