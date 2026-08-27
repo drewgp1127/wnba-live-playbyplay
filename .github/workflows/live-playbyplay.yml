@@ -2,25 +2,24 @@ name: WNBA Live Play By Play
 
 on:
   schedule:
-    # GitHub's `schedule` trigger is best-effort and, in practice for this
-    # repo, was landing roughly once an hour instead of the "every 5
-    # minutes" a naive `*/5` cron implies -- unacceptable during a live
-    # game. Instead of leaning on GitHub to fire reliably every 5 minutes,
-    # each of these 3 launches starts ONE long job that loops and polls
-    # internally (see the run step below), so GitHub only needs to fire
-    # 3 times a day, staggered ~4.5h apart to cover 10:00am-11:30pm ET
-    # (14:00-03:30 UTC during EDT) with a little overlap at the seams.
-    - cron: "0 14 * * *"   # ~10:00am ET
-    - cron: "30 18 * * *"  # ~2:30pm ET
-    - cron: "0 23 * * *"   # ~7:00pm ET
+    # Hourly check-in instead of 3 big blind ~4.5h windows. Each firing runs
+    # wnba_playbyplay_gate.py first, which looks at TODAY's real game times
+    # (not a guessed clock window) and decides whether there's anything
+    # worth polling for right now; the actual poll loop below only runs
+    # when the gate says yes. This also shrinks the blast radius of a
+    # missed firing -- GitHub's `schedule` trigger is best-effort and on
+    # 2026-08-26 silently skipped one of the old 3 windows entirely,
+    # leaving the tracker dead for 5+ hours during that night's games.
+    # A missed hourly firing now only costs about an hour, not half a night.
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 concurrency:
   # Never let two of these loops write to the shared Google Sheet at the
   # same time -- the script does a full clear()+rewrite of the Play By
   # Play tab, so an overlapping run could wipe out the other's writes.
-  # Queue (don't cancel) so a staggered launch just waits its turn instead
-  # of losing the run outright.
+  # Queue (don't cancel) so a later firing just waits its turn instead of
+  # losing the run outright.
   group: live-pbp
   cancel-in-progress: false
 
@@ -41,12 +40,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check whether a game is relevant right now
+        id: gate
+        run: python wnba_playbyplay_gate.py
+        continue-on-error: true
+
       - name: Write Google service account credentials
+        if: steps.gate.outcome == 'success'
         run: printf '%s' "$GOOGLE_CREDENTIALS_JSON" > "$RUNNER_TEMP/gcreds.json"
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
       - name: Capture live first-4-minutes play by play (polls every 5 min for ~4.4h)
+        if: steps.gate.outcome == 'success'
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
           MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
