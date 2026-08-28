@@ -11,7 +11,13 @@ on:
     # 2026-08-26 silently skipped one of the old 3 windows entirely,
     # leaving the tracker dead for 5+ hours during that night's games.
     # A missed hourly firing now only costs about an hour, not half a night.
+    #
+    # Two entries, not one: `schedule` delivery is the single least reliable
+    # part of this system (see wnba_playbyplay_selfchain.py), so this takes
+    # two chances an hour rather than one. Any firing that lands while a run
+    # is already going is harmlessly dropped by the concurrency group below.
     - cron: "0 * * * *"
+    - cron: "30 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -76,3 +82,16 @@ jobs:
               break
             fi
           done
+
+      # The poll loop above is capped at ~265 minutes. If it hit that cap
+      # while games were still on, nothing would restart it until the next
+      # `schedule` firing lands -- and those are precisely what this repo
+      # cannot count on. Hand off to a fresh run instead, so one delivered
+      # event sustains coverage for the whole slate. No-ops when the slate
+      # is over or no token is configured.
+      - name: Hand off to a fresh run if games are still live
+        if: steps.gate.outcome == 'success'
+        env:
+          SELF_DISPATCH_TOKEN: ${{ secrets.SELF_DISPATCH_TOKEN }}
+          MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
+        run: python wnba_playbyplay_selfchain.py
