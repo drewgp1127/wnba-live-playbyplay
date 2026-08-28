@@ -51,17 +51,28 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
-      - name: Capture live first-4-minutes play by play (polls every 5 min for ~4.4h)
+      - name: Capture live first-4-minutes play by play (polls every 5 min, up to ~4.4h)
         if: steps.gate.outcome == 'success'
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
           MAIN_PIPELINE_DISPATCH_TOKEN: ${{ secrets.MAIN_PIPELINE_DISPATCH_TOKEN }}
         run: |
-          END=$((SECONDS + 15900))  # ~265 minutes
+          # ~265 minutes is a ceiling, not a target. The loop normally ends
+          # earlier, when the gate says the slate is over -- see below.
+          END=$((SECONDS + 15900))
           while true; do
             python wnba_playbyplay_live.py
             if [ "$SECONDS" -ge "$END" ]; then
+              echo "Hit the ~265-minute ceiling -- exiting; the next hourly firing takes over."
               break
             fi
             sleep 300
+            # Re-check relevance between cycles. Without this the job holds
+            # the `live-pbp` concurrency group for the full ceiling even once
+            # every game has finished, which blocks the next ~4 hourly
+            # firings and defeats the point of checking in hourly at all.
+            if ! python wnba_playbyplay_gate.py; then
+              echo "Nothing relevant left today -- exiting early to free the concurrency group."
+              break
+            fi
           done
