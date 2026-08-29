@@ -1,2 +1,6 @@
 # Secrets - never commit these
 *.json
+
+# Local Python bytecode -- sheets.py being importable means this now
+# appears whenever the script is run locally.
+__pycache__/

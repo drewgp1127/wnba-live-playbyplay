@@ -48,6 +48,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
+import sheets as sheets_client
 from curl_cffi import requests
 from google.oauth2.service_account import Credentials
 from tenacity import (
@@ -346,7 +347,12 @@ def get_or_create_tab(spreadsheet, sheet_name, header):
 def main():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
-    client = gspread.authorize(creds)
+    # sheets_client.authorize(), not gspread.authorize(): this script is
+    # the heaviest Sheets consumer in the system (a poll every 5 minutes,
+    # four full-tab reads and a whole-tab rewrite each time) and shares one
+    # service account -- and therefore one per-minute quota -- with the main
+    # pipeline. Bare gspread turns a 429 into a dead run. See sheets.py.
+    client = sheets_client.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
 
     print("Checking today's scoreboard for live/finished games...")
@@ -468,7 +474,37 @@ def main():
         fb_ws.append_rows(fb_new_rows, value_input_option="USER_ENTERED")
 
     if updates:
-        kept_rows = [r for r in existing_rows if r and r[0] not in updates]
+        # RE-READ before writing back, and rebuild from the fresh copy.
+        #
+        # This is a clear()+full-rewrite, so it replaces the entire tab with
+        # whatever this run believes it should contain. `existing_rows` was
+        # read at the top of main(), before a scoreboard fetch and one ESPN
+        # summary fetch per live game -- easily tens of seconds. Anything
+        # appended to Play By Play inside that window is absent from the
+        # snapshot and would be silently erased by the write-back. The
+        # victim gets no error; only the destroying run would know, and it
+        # doesn't look.
+        #
+        # The other writer is a different REPOSITORY: the main pipeline's
+        # wnba_playbyplay_tab.py appends historical games as step 7 of its
+        # daily run. GitHub concurrency groups are scoped per-repo, so this
+        # repo's `live-pbp` group cannot see that job and provides no
+        # protection against it. Today's clocks keep them apart (8:17am ET
+        # vs. game hours) but nothing enforces that, and a workflow_dispatch
+        # answers to no clock at all.
+        #
+        # Re-reading immediately before the write is what makes the window
+        # small enough not to matter, rather than relying on the schedule.
+        current_values = pbp_ws.get_all_values()
+        current_rows = current_values[1:] if current_values else []
+
+        appeared = len(current_rows) - len(existing_rows)
+        if appeared > 0:
+            print(f"  NOTE: {appeared} row(s) appeared in '{PBP_SHEET_NAME}' since this run "
+                  f"started -- most likely the main pipeline's own play-by-play step. "
+                  f"Merging them in rather than overwriting them.")
+
+        kept_rows = [r for r in current_rows if r and r[0] not in updates]
         all_rows = kept_rows + [row for rows in updates.values() for row in rows]
 
         print(f"Writing Play By Play: {len(kept_rows)} untouched row(s) kept, {len(updates)} game(s) updated.")
@@ -476,6 +512,16 @@ def main():
         pbp_ws.update(range_name="A1", values=[PBP_HEADER], value_input_option="USER_ENTERED")
         if all_rows:
             pbp_ws.update(range_name=f"A2:K{len(all_rows) + 1}", values=all_rows, value_input_option="RAW")
+
+        # Assert the rewrite did what it claimed. A clear() that succeeded
+        # followed by an update() that partially failed leaves the tab
+        # truncated, and every consumer downstream reads that as "these
+        # games have no plays" rather than as an error.
+        written = len(pbp_ws.get_all_values()) - 1
+        if written != len(all_rows):
+            print(f"  WARNING: expected {len(all_rows)} data row(s) in '{PBP_SHEET_NAME}' "
+                  f"after the rewrite, found {written}. The tab may be truncated -- "
+                  f"the next poll will rebuild it, but check before trusting live grading.")
     else:
         print("No new plays to write.")
 
