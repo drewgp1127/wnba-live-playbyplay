@@ -51,7 +51,22 @@ from datetime import datetime, timezone
 
 from wnba_playbyplay_live import REAL_TEAMS, get_todays_events
 
-LOOKAHEAD_MINUTES = 15
+# Must comfortably exceed the cron interval, or there is a systematic blind
+# window before every tip. With hourly firings and a 15-minute lookahead, a
+# game tipping 20+ minutes after a firing is skipped by that firing and only
+# picked up by the next one, up to an hour later. Observed live on
+# 2026-08-28: the 23:07Z run skipped, POR @ ATL tipped in the gap, and by the
+# time polling started the game was well into Q1 -- its post-tip intraday
+# dispatch window (60-420s remaining in Q1, read off the CURRENT scoreboard
+# clock) had already passed and that dispatch never fired at all. The plays
+# and the first basket were still captured, since the summary endpoint
+# returns the whole game retroactively, but the dispatch is gone for good.
+#
+# 75 = the 60-minute cron interval plus margin for GitHub's delivery lag,
+# which has been running 7-13 minutes late. Starting a poll loop early costs
+# nothing (public repo, unlimited minutes) and the loop now re-gates between
+# cycles, so an early start exits on its own once the slate is over.
+LOOKAHEAD_MINUTES = 75
 # How long after tip-off a finished game still counts as worth polling for.
 # Long enough to cover a full game plus overtime plus a late-posted final
 # (and to backfill an evening slate the tracker slept through), short enough
@@ -92,7 +107,8 @@ def _game_is_relevant_now(event, now_utc):
 
     if state == "post":
         return 0 <= minutes_from_tip <= POST_GAME_GRACE_MINUTES
-    # "pre" (or an unrecognised state): only once tip-off is imminent.
+    # "pre" (or an unrecognised state): once tip-off is close enough that the
+    # NEXT cron firing would already be too late -- see LOOKAHEAD_MINUTES.
     return -LOOKAHEAD_MINUTES <= minutes_from_tip <= 0
 
 
