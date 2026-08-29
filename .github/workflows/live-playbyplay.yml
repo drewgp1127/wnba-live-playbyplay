@@ -57,7 +57,12 @@ jobs:
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
 
-      - name: Capture live first-4-minutes play by play (polls every 5 min, up to ~4.4h)
+      # "Opening plays" -- everything up to the point where BOTH teams have
+      # logged their own first scoring play. This used to stop at the first 4
+      # minutes of Q1 and the step name still said so long after the code
+      # changed; a fixed window silently drops the First Team Basket market
+      # whenever the slower-scoring team is not on the board that early.
+      - name: Capture live opening play by play (polls every 5 min, up to ~4.4h)
         if: steps.gate.outcome == 'success'
         env:
           GOOGLE_CREDENTIALS_PATH: ${{ runner.temp }}/gcreds.json
