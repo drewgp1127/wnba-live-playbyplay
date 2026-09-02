@@ -1,4 +1,22 @@
-gspread
-google-auth
-curl_cffi
-tenacity
+# Upper bounds, not exact pins.
+#
+# This runs on a 300s polling loop, so an unpinned dependency means the
+# toolchain can change under a process that has no commit behind it. The
+# specific trap: worksheet writes used the pre-6.x update(range, values)
+# argument order, which gspread 6 accepts only through a compatibility
+# shim that detects (str, list) and swaps them. The first release to drop
+# that shim would have turned the header write into a TypeError, or into
+# 'write the string A1 into the range the list stringifies to', with
+# nothing in this repo changed.
+#
+# The call is keyword form now, so that trap is closed; the bounds are
+# here so the NEXT breaking change arrives as a deliberate upgrade rather
+# than as a silently broken tracker. Major versions only, so security and
+# bug-fix releases still flow in.
+#
+# Kept in step with bball-bots/requirements.txt, which pins the same four
+# for the same reasons.
+gspread>=6,<7
+google-auth>=2,<3
+curl_cffi>=0.16,<1
+tenacity>=8,<10
