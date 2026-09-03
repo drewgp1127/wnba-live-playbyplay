@@ -57,6 +57,41 @@ def _is_retryable(exc):
     return isinstance(exc, gspread.exceptions.APIError) and _status_code(exc) in _RETRYABLE_STATUS
 
 
+# Methods it is safe to send twice.
+#
+# GET is a read. PUT is values.update, which writes a specific range: doing
+# it again with the same body produces the same sheet, so a retry is free.
+#
+# POST is neither. values:append is a POST, and Google can commit an append
+# and STILL return a 5xx -- the row is in the sheet, the caller sees a
+# failure, and a blind retry appends it a second time.
+#
+# This repo is the one that appends. wnba_playbyplay_live.py appends to
+# 'Live First Basket', to the dispatch tab and to the grading dispatch tab,
+# and the FirstIQ app reads 'Live First Basket' directly: a duplicate row
+# there is a first basket recorded twice for one game, which the app then
+# joins to its slate. Nothing downstream dedupes it, and nothing logs that
+# it happened.
+#
+# A duplicate row is silent and permanent. A failed append is loud and the
+# next poll retries it 300 seconds later, which is the recoverable half of
+# the trade.
+_RETRYABLE_METHODS = {"GET", "PUT"}
+
+
+def _request_method(args, kwargs):
+    """The HTTP verb from gspread's request(method, endpoint, ...) call.
+
+    Returns None when it cannot be determined, which is treated as
+    non-retryable -- guessing wrong in that direction costs a retry, and
+    guessing wrong in the other costs a duplicated row.
+    """
+    method = kwargs.get("method")
+    if method is None and args:
+        method = args[0]
+    return method.upper() if isinstance(method, str) else None
+
+
 def authorize(creds):
     """gspread.authorize(), plus retry on quota and transient errors.
 
@@ -67,6 +102,10 @@ def authorize(creds):
     The polling loop sleeps 300s between runs, so even a full 5-attempt
     backoff finishes comfortably inside one poll interval -- a retried run
     delays the next poll's start, it never overlaps it.
+
+    Only GET and PUT are retried -- see _RETRYABLE_METHODS. Retrying an
+    append can duplicate a row Google already committed before it returned
+    an error, and this process appends to the tab the app reads.
     """
     client = gspread.authorize(creds)
 
@@ -81,7 +120,14 @@ def authorize(creds):
         retry=retry_if_exception(_is_retryable),
         reraise=True,
     )
+    def _request_with_retry(*args, **kwargs):
+        return inner(*args, **kwargs)
+
     def request(*args, **kwargs):
+        if _request_method(args, kwargs) in _RETRYABLE_METHODS:
+            return _request_with_retry(*args, **kwargs)
+        # Non-idempotent (POST: values:append, batchUpdate). One attempt,
+        # and let the failure surface.
         return inner(*args, **kwargs)
 
     transport.request = request

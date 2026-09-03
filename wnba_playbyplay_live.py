@@ -340,7 +340,11 @@ def get_or_create_tab(spreadsheet, sheet_name, header):
     except gspread.WorksheetNotFound:
         print(f"'{sheet_name}' tab doesn't exist yet -- creating it.")
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=len(header))
-        ws.update([header], "A1", value_input_option="USER_ENTERED")
+        # Keyword form: gspread has swapped this argument order once
+        # already and accepts the old one only through a shim that
+        # detects (str, list). Positional is a bet on which major
+        # version is installed at run time.
+        ws.update(range_name="A1", values=[header], value_input_option="USER_ENTERED")
         return ws
 
 

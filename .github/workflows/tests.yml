@@ -1,0 +1,45 @@
+name: Tests
+
+# This repo had no CI. Its only workflow is the scheduled poller, which
+# means a change to the Sheets client was previously verified by pushing it
+# and waiting to see whether that night's tracker still worked -- against a
+# live spreadsheet the app reads, on a 300s loop, during games.
+#
+# The checks below are the two cheap ones: does it parse, and does the
+# retry gate still refuse to retry an append.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pyflakes + pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pyflakes
+
+      - name: Pyflakes
+        run: python -m pyflakes *.py tests/
+
+      - name: Pytest
+        run: python -m pytest tests/ -q
